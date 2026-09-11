@@ -1,7 +1,7 @@
 {
   "domain": "controlart",
   "name": "ControlArt Wired Modules",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "documentation": "https://github.com/arthurperezbessa/Home-Assistant-Controlart-MC",
   "issue_tracker": "https://github.com/arthurperezbessa/Home-Assistant-Controlart-MC/issues",
   "config_flow": true,

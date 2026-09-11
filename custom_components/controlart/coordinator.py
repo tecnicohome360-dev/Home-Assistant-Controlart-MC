@@ -14,6 +14,7 @@ from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -83,6 +84,7 @@ class ControlArtCoordinator(DataUpdateCoordinator[ModuleState]):
             port,
             message_callback=self._handle_message,
             connect_callback=self._on_connect,
+            disconnect_callback=self._on_disconnect,
         )
 
         super().__init__(
@@ -115,8 +117,20 @@ class ControlArtCoordinator(DataUpdateCoordinator[ModuleState]):
 
     @callback
     def _on_connect(self) -> None:
-        """Após (re)conectar, agenda uma atualização."""
-        self.hass.async_create_task(self.async_request_refresh())
+        """Após (re)conectar, agenda uma atualização.
+
+        As entidades só voltam a ficar disponíveis quando o módulo responder
+        ao status. Chama o refresh direto (sem o debouncer) para não atrasar
+        a volta em até 10 s após uma reconexão rápida.
+        """
+        self.hass.async_create_task(self.async_refresh())
+
+    @callback
+    def _on_disconnect(self) -> None:
+        """Conexão caiu: marca as entidades como indisponíveis na hora."""
+        self.async_set_update_error(
+            UpdateFailed(f"Conexão com {self.protocol.host} perdida")
+        )
 
     async def _async_update_data(self) -> ModuleState:
         """Solicita o status completo do módulo."""
@@ -126,10 +140,14 @@ class ControlArtCoordinator(DataUpdateCoordinator[ModuleState]):
             await self.protocol.async_query(
                 cmd, lambda line: line.startswith(prefix), timeout=6
             )
+        except ConnectionError as err:
+            raise UpdateFailed("Módulo desconectado") from err
         except asyncio.TimeoutError as err:
-            if not self.protocol.connected:
-                raise UpdateFailed("Módulo desconectado") from err
-            _LOGGER.debug("Sem resposta de status de %s", self.entry.title)
+            # Socket aberto mas sem resposta: provável queda de rede sem
+            # FIN/RST. Derruba a conexão para descartar comandos pendentes e
+            # deixa o supervisor reconectar.
+            self.protocol.drop_connection()
+            raise UpdateFailed("Módulo não respondeu ao status") from err
         return self.state
 
     async def _fetch_dimmer_config(self) -> None:
@@ -142,7 +160,7 @@ class ControlArtCoordinator(DataUpdateCoordinator[ModuleState]):
                 await self.protocol.async_query(
                     cmd, lambda line, p=prefix: line.startswith(p), timeout=5
                 )
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, ConnectionError):
                 _LOGGER.debug("Sem resposta para %s", cmd)
 
     # ------------------------------------------------------- recepção/parsing
@@ -236,22 +254,40 @@ class ControlArtCoordinator(DataUpdateCoordinator[ModuleState]):
         if dev_id and typ:
             self._ping_results[dev_id] = int(typ)
 
+    # ------------------------------------------------------------- comandos
+    async def _async_send(self, command: str) -> None:
+        """Envia um comando; recusa se o módulo estiver indisponível.
+
+        Evita que um comando dado com o módulo fora da rede seja executado
+        horas depois, quando ele voltar.
+        """
+        if not self.last_update_success:
+            raise HomeAssistantError(
+                f"{self.entry.title} indisponível; comando não enviado"
+            )
+        try:
+            await self.protocol.async_send(command)
+        except ConnectionError as err:
+            raise HomeAssistantError(
+                f"{self.entry.title} desconectado; comando não enviado"
+            ) from err
+
     # ------------------------------------------------------- comandos: relés
     async def async_set_relay(self, ch: int, value: int) -> None:
         """Liga/desliga uma saída de relé (CH 0..9, value 0/1)."""
-        await self.protocol.async_send(
+        await self._async_send(
             f"mdcmd_sendrele,{self.mac_str},{ch},{value}"
         )
 
     async def async_set_relays(self, mask: int, value: int) -> None:
         """Liga/desliga múltiplas saídas de relé via máscara."""
-        await self.protocol.async_send(
+        await self._async_send(
             f"mdcmd_msendrele,{self.mac_str},{mask},{value}"
         )
 
     async def async_toggle_relays(self, mask: int) -> None:
         """Inverte múltiplas saídas de relé via máscara."""
-        await self.protocol.async_send(
+        await self._async_send(
             f"mdcmd_mtogglerele,{self.mac_str},{mask}"
         )
 
@@ -266,26 +302,26 @@ class ControlArtCoordinator(DataUpdateCoordinator[ModuleState]):
         self, mask: int, percent: int, ramp: int
     ) -> None:
         """Ajusta múltiplas saídas de dimmer por percentual via máscara."""
-        await self.protocol.async_send(
+        await self._async_send(
             f"mdcmd_msendpermd,{self.mac_str},{mask},{percent},{ramp}"
         )
 
     async def async_toggle_dimmers(self, mask: int) -> None:
         """Inverte múltiplas saídas de dimmer via máscara."""
-        await self.protocol.async_send(
+        await self._async_send(
             f"mdcmd_mtogglemd,{self.mac_str},{mask}"
         )
 
     # --------------------------------------------- comandos: motor/cortina
     async def async_cover_move(self, ch: int, direction: int) -> None:
         """Aciona a cortina: direction 0=subir, 1=parar, 2=descer (FUNC=2)."""
-        await self.protocol.async_send(
+        await self._async_send(
             f"mdcmd_sendcmd,{self.mac_str},2,{direction},{ch}"
         )
 
     async def async_cover_set_position(self, ch: int, position: int) -> None:
         """Move a cortina para uma posição absoluta do módulo (0..255, FUNC=0)."""
-        await self.protocol.async_send(
+        await self._async_send(
             f"mdcmd_sendcmd,{self.mac_str},0,{position},{ch}"
         )
 
@@ -298,11 +334,11 @@ class ControlArtCoordinator(DataUpdateCoordinator[ModuleState]):
             "stop_down": f"mdcmd_stopcalibdownmd,{ch}",
             "reset": f"mdcmd_resetcalibdownmd,{ch}",
         }[action]
-        await self.protocol.async_send(cmd)
+        await self._async_send(cmd)
 
     async def async_set_motor_mode(self, ch: int, mode: int) -> None:
         """Altera o modo de operação do motor (0=normal, 1=sem feedback)."""
-        await self.protocol.async_send(
+        await self._async_send(
             f"mdcmd_setmotormodemd,{ch},{mode}"
         )
 
@@ -310,8 +346,10 @@ class ControlArtCoordinator(DataUpdateCoordinator[ModuleState]):
     async def async_scan_keypads(self, duration: float = 2.5) -> dict[str, int]:
         """Faz o SCAN da rede CAN Bus e retorna {dev_id: typ_id}."""
         self._ping_results = {}
-        await self.protocol.async_send("can_ping_req,0,0x000000")
-        await asyncio.sleep(duration)
-        results = self._ping_results or {}
-        self._ping_results = None
+        try:
+            await self._async_send("can_ping_req,0,0x000000")
+            await asyncio.sleep(duration)
+            results = self._ping_results or {}
+        finally:
+            self._ping_results = None
         return dict(results)

@@ -22,6 +22,9 @@ Não depende de nuvem nem de servidores externos.
 - **Serviços** de calibração de cortina diretamente pelo Home Assistant.
 - Conexão TCP persistente com reconexão automática e ressincronização
   periódica do estado.
+- Se o módulo sai da rede, as entidades ficam **indisponíveis** na hora e os
+  comandos são descartados — nada fica na fila para ser executado quando o
+  módulo voltar.
 
 ## Instalação
 

@@ -19,6 +19,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = ControlArtCoordinator(hass, entry)
     try:
         await coordinator.async_setup()
+    except ConfigEntryNotReady:
+        # Primeira leitura falhou: encerra a conexão antes do HA tentar de novo.
+        await coordinator.async_shutdown()
+        raise
     except (ConnectionError, TimeoutError) as err:
         await coordinator.async_shutdown()
         raise ConfigEntryNotReady(str(err)) from err
